@@ -220,6 +220,8 @@ fn init_negacyclic_twiddles_shoup(
 /// Negacyclic NTT plan for 64bit primes.
 #[derive(Clone)]
 pub struct Plan {
+    root: u64,
+
     twid: ABox<[u64]>,
     twid_shoup: ABox<[u64]>,
     inv_twid: ABox<[u64]>,
@@ -706,10 +708,12 @@ impl Plan {
         // 16 = 8x2 = max_register_size * ntt_radix,
         // as SIMD registers can contain at most 8*u64
         // and the implementation assumes that SIMD registers are full
-        if polynomial_size < 16
-            || !polynomial_size.is_power_of_two()
-            || !is_prime64(modulus)
-            || find_primitive_root64(p_div, 2 * polynomial_size as u64).is_none()
+        let mut w = None;
+        let mut f = || {
+            w = find_primitive_root64(p_div, 2 * polynomial_size as u64);
+            w.is_none()
+        };
+        if polynomial_size < 16 || !polynomial_size.is_power_of_two() || !is_prime64(modulus) || f()
         {
             None
         } else {
@@ -723,6 +727,8 @@ impl Plan {
             let has_ifma = false;
 
             let bits = if has_ifma { 52 } else { 64 };
+
+            let w = w.unwrap();
 
             let mut twid = avec![0u64; polynomial_size].into_boxed_slice();
             let mut inv_twid = avec![0u64; polynomial_size].into_boxed_slice();
@@ -756,6 +762,7 @@ impl Plan {
             let p_barrett = ((1u128 << big_l) / modulus as u128) as u64;
 
             Some(Self {
+                root: w,
                 twid,
                 twid_shoup,
                 inv_twid_shoup,
@@ -768,6 +775,12 @@ impl Plan {
                 n_inv_mod_p_shoup,
             })
         }
+    }
+
+    /// Returns the root of the negacyclic NTT plan.
+    #[inline]
+    pub fn root(&self) -> u64 {
+        self.root
     }
 
     /// Returns the polynomial size of the negacyclic NTT plan.
