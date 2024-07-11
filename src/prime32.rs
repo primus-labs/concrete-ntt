@@ -600,6 +600,8 @@ fn mul_accumulate_scalar(
 /// Negacyclic NTT plan for 32bit primes.
 #[derive(Clone)]
 pub struct Plan {
+    root: u32,
+
     twid: ABox<[u32]>,
     twid_shoup: ABox<[u32]>,
     inv_twid: ABox<[u32]>,
@@ -632,14 +634,19 @@ impl Plan {
         // 32 = 16x2 = max_register_size * ntt_radix,
         // as SIMD registers can contain at most 16*u32
         // and the implementation assumes that SIMD registers are full
+        let mut w = None;
+        let mut f = || {
+            w = find_primitive_root64(Div64::new(modulus as u64), 2 * polynomial_size as u64);
+            w.is_none()
+        };
         if polynomial_size < 32
             || !polynomial_size.is_power_of_two()
             || !is_prime64(modulus as u64)
-            || find_primitive_root64(Div64::new(modulus as u64), 2 * polynomial_size as u64)
-                .is_none()
+            || f()
         {
             None
         } else {
+            let w = w.unwrap() as u32;
             let mut twid = avec![0u32; polynomial_size].into_boxed_slice();
             let mut inv_twid = avec![0u32; polynomial_size].into_boxed_slice();
             let (mut twid_shoup, mut inv_twid_shoup) = if modulus < (1u32 << 31) {
@@ -671,6 +678,7 @@ impl Plan {
             let p_barrett = ((1u64 << big_l) / modulus as u64) as u32;
 
             Some(Self {
+                root: w,
                 twid,
                 twid_shoup,
                 inv_twid_shoup,
@@ -683,6 +691,12 @@ impl Plan {
                 big_q,
             })
         }
+    }
+
+    /// Returns the root of the negacyclic NTT plan.
+    #[inline]
+    pub fn root(&self) -> u32 {
+        self.root
     }
 
     /// Returns the polynomial size of the negacyclic NTT plan.
