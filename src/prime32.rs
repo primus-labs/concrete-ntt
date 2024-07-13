@@ -652,6 +652,7 @@ impl Plan {
             None
         } else {
             let w = w.unwrap() as u32;
+
             let mut root_powers = avec![0u32; polynomial_size*2].into_boxed_slice();
             let mut twid = avec![0u32; polynomial_size].into_boxed_slice();
             let mut inv_twid = avec![0u32; polynomial_size].into_boxed_slice();
@@ -723,6 +724,7 @@ impl Plan {
                 root: w,
                 root_powers,
                 root_powers_shoup,
+
                 twid,
                 twid_shoup,
                 inv_twid_shoup,

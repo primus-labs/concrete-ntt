@@ -805,8 +805,10 @@ impl Plan {
 
             Some(Self {
                 root: w,
+
                 root_powers,
                 root_powers_shoup,
+
                 twid,
                 twid_shoup,
                 inv_twid_shoup,
