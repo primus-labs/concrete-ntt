@@ -618,6 +618,8 @@ pub struct Plan {
 
     n_inv_mod_p: u32,
     n_inv_mod_p_shoup: u32,
+
+    reverse_lsbs: Vec<usize>,
 }
 
 impl core::fmt::Debug for Plan {
@@ -715,6 +717,10 @@ impl Plan {
             let big_l = big_q + 31;
             let p_barrett = ((1u64 << big_l) / modulus as u64) as u32;
 
+            let nbits = polynomial_size.trailing_zeros();
+            let reverse_lsbs: Vec<usize> =
+                (0..polynomial_size).map(|i| bit_rev(nbits, i)).collect();
+
             Some(Self {
                 root: w,
                 root_powers,
@@ -729,6 +735,7 @@ impl Plan {
                 n_inv_mod_p_shoup,
                 p_barrett,
                 big_q,
+                reverse_lsbs,
             })
         }
     }
@@ -761,6 +768,114 @@ impl Plan {
     #[inline]
     pub fn modulus(&self) -> u32 {
         self.p
+    }
+
+    pub fn fwd_monomial(&self, coeff: u32, degree: usize, values: &mut [u32]) {
+        if coeff == 0 {
+            values.fill(0);
+            return;
+        }
+
+        if degree == 0 {
+            values.fill(coeff);
+            return;
+        }
+
+        let n = self.ntt_size();
+        let log_n = n.trailing_zeros();
+        assert_eq!(values.len(), n);
+
+        let mask = usize::MAX >> (usize::BITS - log_n - 1);
+
+        let p = self.p;
+
+        if coeff == 1 {
+            values
+                .iter_mut()
+                .zip(&self.reverse_lsbs)
+                .for_each(|(v, &i)| {
+                    let index = ((2 * i + 1) * degree) & mask;
+                    *v = unsafe { *self.root_powers.get_unchecked(index) };
+                })
+        } else if coeff == p - 1 {
+            values
+                .iter_mut()
+                .zip(&self.reverse_lsbs)
+                .for_each(|(v, &i)| {
+                    let index = (((2 * i + 1) * degree) & mask) ^ n;
+                    *v = unsafe { *self.root_powers.get_unchecked(index) };
+                })
+        } else {
+            if p < (1u32 << 31) {
+                values
+                    .iter_mut()
+                    .zip(&self.reverse_lsbs)
+                    .for_each(|(v, &i)| {
+                        let index = ((2 * i + 1) * degree) & mask;
+                        let e = unsafe { *self.root_powers.get_unchecked(index) };
+                        let e_shoup = unsafe { *self.root_powers_shoup.get_unchecked(index) };
+
+                        let hw = (((e_shoup as u64) * (coeff as u64)) >> 32) as u32;
+                        let t = e.wrapping_mul(coeff).wrapping_sub(hw.wrapping_mul(p));
+                        *v = t.min(t.wrapping_sub(p));
+                    })
+            } else {
+                values
+                    .iter_mut()
+                    .zip(&self.reverse_lsbs)
+                    .for_each(|(v, &i)| {
+                        let index = ((2 * i + 1) * degree) & mask;
+                        *v = generic::mul(
+                            self.p_div,
+                            unsafe { *self.root_powers.get_unchecked(index) },
+                            coeff,
+                        );
+                    })
+            }
+        }
+    }
+
+    pub fn fwd_coeff_one_monomial(&self, degree: usize, values: &mut [u32]) {
+        if degree == 0 {
+            values.fill(1);
+            return;
+        }
+
+        let n = self.ntt_size();
+        let log_n = n.trailing_zeros();
+        assert_eq!(values.len(), n);
+
+        let mask = usize::MAX >> (usize::BITS - log_n - 1);
+
+        values
+            .iter_mut()
+            .zip(&self.reverse_lsbs)
+            .for_each(|(v, &i)| {
+                let index = ((2 * i + 1) * degree) & mask;
+                *v = unsafe { *self.root_powers.get_unchecked(index) };
+            })
+    }
+
+    pub fn fwd_coeff_neg_one_monomial(&self, degree: usize, values: &mut [u32]) {
+        if degree == 0 {
+            let neg_one = self.p - 1;
+            values.fill(neg_one);
+            return;
+        }
+
+        let n = self.ntt_size();
+        let log_n = n.trailing_zeros();
+        assert_eq!(values.len(), n);
+
+        let mask = usize::MAX >> (usize::BITS - log_n - 1);
+
+        values
+            .iter_mut()
+            .zip(&self.reverse_lsbs)
+            .for_each(|(v, &i)| {
+                let index = (((2 * i + 1) * degree) & mask) ^ n;
+                *v = unsafe { *self.root_powers.get_unchecked(index) };
+            })
     }
 
     /// Applies a forward negacyclic NTT transform in place to the given buffer.
