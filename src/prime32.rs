@@ -602,6 +602,9 @@ fn mul_accumulate_scalar(
 pub struct Plan {
     root: u32,
 
+    root_powers: ABox<[u32]>,
+    root_powers_shoup: ABox<[u32]>,
+
     twid: ABox<[u32]>,
     twid_shoup: ABox<[u32]>,
     inv_twid: ABox<[u32]>,
@@ -647,18 +650,42 @@ impl Plan {
             None
         } else {
             let w = w.unwrap() as u32;
+            let mut root_powers = avec![0u32; polynomial_size*2].into_boxed_slice();
             let mut twid = avec![0u32; polynomial_size].into_boxed_slice();
             let mut inv_twid = avec![0u32; polynomial_size].into_boxed_slice();
-            let (mut twid_shoup, mut inv_twid_shoup) = if modulus < (1u32 << 31) {
-                (
-                    avec![0u32; polynomial_size].into_boxed_slice(),
-                    avec![0u32; polynomial_size].into_boxed_slice(),
-                )
-            } else {
-                (avec![].into_boxed_slice(), avec![].into_boxed_slice())
-            };
+            let (mut twid_shoup, mut inv_twid_shoup, mut root_powers_shoup) =
+                if modulus < (1u32 << 31) {
+                    (
+                        avec![0u32; polynomial_size].into_boxed_slice(),
+                        avec![0u32; polynomial_size].into_boxed_slice(),
+                        avec![0u32; polynomial_size*2].into_boxed_slice(),
+                    )
+                } else {
+                    (
+                        avec![].into_boxed_slice(),
+                        avec![].into_boxed_slice(),
+                        avec![].into_boxed_slice(),
+                    )
+                };
 
             if modulus < (1u32 << 31) {
+                let div = Div32::new(modulus);
+                let mut wk = w;
+
+                root_powers[0] = 1;
+                root_powers_shoup[0] = Div32::div_u64((1 as u64) << 32, div) as u32;
+                root_powers[1] = w;
+                root_powers_shoup[1] = Div32::div_u64((w as u64) << 32, div) as u32;
+
+                for (root_power, root_power_shoup) in root_powers[2..]
+                    .iter_mut()
+                    .zip(root_powers_shoup[2..].iter_mut())
+                {
+                    wk = Div32::rem_u64(wk as u64 * w as u64, div);
+                    *root_power = wk;
+                    *root_power_shoup = Div32::div_u64((wk as u64) << 32, div) as u32
+                }
+
                 init_negacyclic_twiddles_shoup(
                     modulus,
                     polynomial_size,
@@ -668,6 +695,17 @@ impl Plan {
                     &mut inv_twid_shoup,
                 );
             } else {
+                let div = Div32::new(modulus);
+                let mut wk = w;
+
+                root_powers[0] = 1;
+                root_powers[1] = w;
+
+                for root_power in root_powers[2..].iter_mut() {
+                    wk = Div32::rem_u64(wk as u64 * w as u64, div);
+                    *root_power = wk;
+                }
+
                 init_negacyclic_twiddles(modulus, polynomial_size, &mut twid, &mut inv_twid);
             }
 
@@ -679,6 +717,8 @@ impl Plan {
 
             Some(Self {
                 root: w,
+                root_powers,
+                root_powers_shoup,
                 twid,
                 twid_shoup,
                 inv_twid_shoup,
@@ -697,6 +737,18 @@ impl Plan {
     #[inline]
     pub fn root(&self) -> u32 {
         self.root
+    }
+
+    /// Returns a reference to the root powers of this [`Plan`].
+    #[inline]
+    pub fn root_powers(&self) -> &[u32] {
+        &self.root_powers
+    }
+
+    /// Returns a reference to the root powers shoup of this [`Plan`].
+    #[inline]
+    pub fn root_powers_shoup(&self) -> &[u32] {
+        &self.root_powers_shoup
     }
 
     /// Returns the polynomial size of the negacyclic NTT plan.
