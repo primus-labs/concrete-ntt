@@ -222,6 +222,9 @@ fn init_negacyclic_twiddles_shoup(
 pub struct Plan {
     root: u64,
 
+    root_powers: ABox<[u64]>,
+    root_powers_shoup: ABox<[u64]>,
+
     twid: ABox<[u64]>,
     twid_shoup: ABox<[u64]>,
     inv_twid: ABox<[u64]>,
@@ -235,6 +238,8 @@ pub struct Plan {
 
     n_inv_mod_p: u64,
     n_inv_mod_p_shoup: u64,
+
+    reverse_lsbs: Vec<usize>,
 }
 
 impl core::fmt::Debug for Plan {
@@ -730,18 +735,41 @@ impl Plan {
 
             let w = w.unwrap();
 
+            let mut root_powers = avec![0u64; polynomial_size*2].into_boxed_slice();
             let mut twid = avec![0u64; polynomial_size].into_boxed_slice();
             let mut inv_twid = avec![0u64; polynomial_size].into_boxed_slice();
-            let (mut twid_shoup, mut inv_twid_shoup) = if modulus < (1u64 << 63) {
-                (
-                    avec![0u64; polynomial_size].into_boxed_slice(),
-                    avec![0u64; polynomial_size].into_boxed_slice(),
-                )
-            } else {
-                (avec![].into_boxed_slice(), avec![].into_boxed_slice())
-            };
+            let (mut twid_shoup, mut inv_twid_shoup, mut root_powers_shoup) =
+                if modulus < (1u64 << 63) {
+                    (
+                        avec![0u64; polynomial_size].into_boxed_slice(),
+                        avec![0u64; polynomial_size].into_boxed_slice(),
+                        avec![0u64; polynomial_size*2].into_boxed_slice(),
+                    )
+                } else {
+                    (
+                        avec![].into_boxed_slice(),
+                        avec![].into_boxed_slice(),
+                        avec![].into_boxed_slice(),
+                    )
+                };
 
             if modulus < (1u64 << 63) {
+                let mut wk = w;
+
+                root_powers[0] = 1;
+                root_powers_shoup[0] = Div64::div_u128((1 as u128) << bits, p_div) as u64;
+                root_powers[1] = w;
+                root_powers_shoup[1] = Div64::div_u128((w as u128) << bits, p_div) as u64;
+
+                for (root_power, root_power_shoup) in root_powers[2..]
+                    .iter_mut()
+                    .zip(root_powers_shoup[2..].iter_mut())
+                {
+                    wk = Div64::rem_u128(wk as u128 * w as u128, p_div);
+                    *root_power = wk;
+                    *root_power_shoup = Div64::div_u128((wk as u128) << bits, p_div) as u64
+                }
+
                 init_negacyclic_twiddles_shoup(
                     modulus,
                     polynomial_size,
@@ -752,6 +780,16 @@ impl Plan {
                     &mut inv_twid_shoup,
                 );
             } else {
+                let mut wk = w;
+
+                root_powers[0] = 1;
+                root_powers[1] = w;
+
+                for root_power in root_powers[2..].iter_mut() {
+                    wk = Div64::rem_u128(wk as u128 * w as u128, p_div);
+                    *root_power = wk;
+                }
+
                 init_negacyclic_twiddles(modulus, polynomial_size, &mut twid, &mut inv_twid);
             }
 
@@ -761,8 +799,14 @@ impl Plan {
             let big_l = big_q + (bits - 1) as u64;
             let p_barrett = ((1u128 << big_l) / modulus as u128) as u64;
 
+            let nbits = polynomial_size.trailing_zeros();
+            let reverse_lsbs: Vec<usize> =
+                (0..polynomial_size).map(|i| bit_rev(nbits, i)).collect();
+
             Some(Self {
                 root: w,
+                root_powers,
+                root_powers_shoup,
                 twid,
                 twid_shoup,
                 inv_twid_shoup,
@@ -773,6 +817,7 @@ impl Plan {
                 big_q,
                 n_inv_mod_p,
                 n_inv_mod_p_shoup,
+                reverse_lsbs,
             })
         }
     }
@@ -781,6 +826,18 @@ impl Plan {
     #[inline]
     pub fn root(&self) -> u64 {
         self.root
+    }
+
+    /// Returns a reference to the root powers of this [`Plan`].
+    #[inline]
+    pub fn root_powers(&self) -> &[u64] {
+        &self.root_powers
+    }
+
+    /// Returns a reference to the root powers shoup of this [`Plan`].
+    #[inline]
+    pub fn root_powers_shoup(&self) -> &[u64] {
+        &self.root_powers_shoup
     }
 
     /// Returns the polynomial size of the negacyclic NTT plan.
@@ -793,6 +850,114 @@ impl Plan {
     #[inline]
     pub fn modulus(&self) -> u64 {
         self.p
+    }
+
+    pub fn fwd_monomial(&self, coeff: u64, degree: usize, values: &mut [u64]) {
+        if coeff == 0 {
+            values.fill(0);
+            return;
+        }
+
+        if degree == 0 {
+            values.fill(coeff);
+            return;
+        }
+
+        let n = self.ntt_size();
+        let log_n = n.trailing_zeros();
+        assert_eq!(values.len(), n);
+
+        let mask = usize::MAX >> (usize::BITS - log_n - 1);
+
+        let p = self.p;
+
+        if coeff == 1 {
+            values
+                .iter_mut()
+                .zip(&self.reverse_lsbs)
+                .for_each(|(v, &i)| {
+                    let index = ((2 * i + 1) * degree) & mask;
+                    *v = unsafe { *self.root_powers.get_unchecked(index) };
+                })
+        } else if coeff == p - 1 {
+            values
+                .iter_mut()
+                .zip(&self.reverse_lsbs)
+                .for_each(|(v, &i)| {
+                    let index = (((2 * i + 1) * degree) & mask) ^ n;
+                    *v = unsafe { *self.root_powers.get_unchecked(index) };
+                })
+        } else {
+            if p < (1u64 << 63) {
+                values
+                    .iter_mut()
+                    .zip(&self.reverse_lsbs)
+                    .for_each(|(v, &i)| {
+                        let index = ((2 * i + 1) * degree) & mask;
+                        let e = unsafe { *self.root_powers.get_unchecked(index) };
+                        let e_shoup = unsafe { *self.root_powers_shoup.get_unchecked(index) };
+
+                        let hw = (((e_shoup as u128) * (coeff as u128)) >> 64) as u64;
+                        let t = e.wrapping_mul(coeff).wrapping_sub(hw.wrapping_mul(p));
+                        *v = t.min(t.wrapping_sub(p));
+                    })
+            } else {
+                values
+                    .iter_mut()
+                    .zip(&self.reverse_lsbs)
+                    .for_each(|(v, &i)| {
+                        let index = ((2 * i + 1) * degree) & mask;
+                        *v = u64::mul(
+                            self.p_div,
+                            unsafe { *self.root_powers.get_unchecked(index) },
+                            coeff,
+                        );
+                    })
+            }
+        }
+    }
+
+    pub fn fwd_coeff_one_monomial(&self, degree: usize, values: &mut [u64]) {
+        if degree == 0 {
+            values.fill(1);
+            return;
+        }
+
+        let n = self.ntt_size();
+        let log_n = n.trailing_zeros();
+        assert_eq!(values.len(), n);
+
+        let mask = usize::MAX >> (usize::BITS - log_n - 1);
+
+        values
+            .iter_mut()
+            .zip(&self.reverse_lsbs)
+            .for_each(|(v, &i)| {
+                let index = ((2 * i + 1) * degree) & mask;
+                *v = unsafe { *self.root_powers.get_unchecked(index) };
+            })
+    }
+
+    pub fn fwd_coeff_neg_one_monomial(&self, degree: usize, values: &mut [u64]) {
+        if degree == 0 {
+            let neg_one = self.p - 1;
+            values.fill(neg_one);
+            return;
+        }
+
+        let n = self.ntt_size();
+        let log_n = n.trailing_zeros();
+        assert_eq!(values.len(), n);
+
+        let mask = usize::MAX >> (usize::BITS - log_n - 1);
+
+        values
+            .iter_mut()
+            .zip(&self.reverse_lsbs)
+            .for_each(|(v, &i)| {
+                let index = (((2 * i + 1) * degree) & mask) ^ n;
+                *v = unsafe { *self.root_powers.get_unchecked(index) };
+            })
     }
 
     /// Applies a forward negacyclic NTT transform in place to the given buffer.

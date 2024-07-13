@@ -671,21 +671,20 @@ impl Plan {
                 };
 
             if modulus < (1u32 << 31) {
-                let div = Div32::new(modulus);
                 let mut wk = w;
 
                 root_powers[0] = 1;
-                root_powers_shoup[0] = Div32::div_u64((1 as u64) << 32, div) as u32;
+                root_powers_shoup[0] = Div32::div_u64((1 as u64) << 32, p_div) as u32;
                 root_powers[1] = w;
-                root_powers_shoup[1] = Div32::div_u64((w as u64) << 32, div) as u32;
+                root_powers_shoup[1] = Div32::div_u64((w as u64) << 32, p_div) as u32;
 
                 for (root_power, root_power_shoup) in root_powers[2..]
                     .iter_mut()
                     .zip(root_powers_shoup[2..].iter_mut())
                 {
-                    wk = Div32::rem_u64(wk as u64 * w as u64, div);
+                    wk = Div32::rem_u64(wk as u64 * w as u64, p_div);
                     *root_power = wk;
-                    *root_power_shoup = Div32::div_u64((wk as u64) << 32, div) as u32
+                    *root_power_shoup = Div32::div_u64((wk as u64) << 32, p_div) as u32
                 }
 
                 init_negacyclic_twiddles_shoup(
@@ -697,14 +696,13 @@ impl Plan {
                     &mut inv_twid_shoup,
                 );
             } else {
-                let div = Div32::new(modulus);
                 let mut wk = w;
 
                 root_powers[0] = 1;
                 root_powers[1] = w;
 
                 for root_power in root_powers[2..].iter_mut() {
-                    wk = Div32::rem_u64(wk as u64 * w as u64, div);
+                    wk = Div32::rem_u64(wk as u64 * w as u64, p_div);
                     *root_power = wk;
                 }
 
