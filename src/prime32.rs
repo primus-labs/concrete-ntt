@@ -600,6 +600,11 @@ fn mul_accumulate_scalar(
 /// Negacyclic NTT plan for 32bit primes.
 #[derive(Clone)]
 pub struct Plan {
+    root: u32,
+
+    root_powers: ABox<[u32]>,
+    root_powers_shoup: ABox<[u32]>,
+
     twid: ABox<[u32]>,
     twid_shoup: ABox<[u32]>,
     inv_twid: ABox<[u32]>,
@@ -613,6 +618,8 @@ pub struct Plan {
 
     n_inv_mod_p: u32,
     n_inv_mod_p_shoup: u32,
+
+    reverse_lsbs: Vec<usize>,
 }
 
 impl core::fmt::Debug for Plan {
@@ -632,26 +639,55 @@ impl Plan {
         // 32 = 16x2 = max_register_size * ntt_radix,
         // as SIMD registers can contain at most 16*u32
         // and the implementation assumes that SIMD registers are full
+        let mut w = None;
+        let mut f = || {
+            w = find_primitive_root64(Div64::new(modulus as u64), 2 * polynomial_size as u64);
+            w.is_none()
+        };
         if polynomial_size < 32
             || !polynomial_size.is_power_of_two()
             || !is_prime64(modulus as u64)
-            || find_primitive_root64(Div64::new(modulus as u64), 2 * polynomial_size as u64)
-                .is_none()
+            || f()
         {
             None
         } else {
+            let w = w.unwrap() as u32;
+
+            let mut root_powers = avec![0u32; polynomial_size*2].into_boxed_slice();
             let mut twid = avec![0u32; polynomial_size].into_boxed_slice();
             let mut inv_twid = avec![0u32; polynomial_size].into_boxed_slice();
-            let (mut twid_shoup, mut inv_twid_shoup) = if modulus < (1u32 << 31) {
-                (
-                    avec![0u32; polynomial_size].into_boxed_slice(),
-                    avec![0u32; polynomial_size].into_boxed_slice(),
-                )
-            } else {
-                (avec![].into_boxed_slice(), avec![].into_boxed_slice())
-            };
+            let (mut twid_shoup, mut inv_twid_shoup, mut root_powers_shoup) =
+                if modulus < (1u32 << 31) {
+                    (
+                        avec![0u32; polynomial_size].into_boxed_slice(),
+                        avec![0u32; polynomial_size].into_boxed_slice(),
+                        avec![0u32; polynomial_size*2].into_boxed_slice(),
+                    )
+                } else {
+                    (
+                        avec![].into_boxed_slice(),
+                        avec![].into_boxed_slice(),
+                        avec![].into_boxed_slice(),
+                    )
+                };
 
             if modulus < (1u32 << 31) {
+                let mut wk = w;
+
+                root_powers[0] = 1;
+                root_powers_shoup[0] = Div32::div_u64((1 as u64) << 32, p_div) as u32;
+                root_powers[1] = w;
+                root_powers_shoup[1] = Div32::div_u64((w as u64) << 32, p_div) as u32;
+
+                for (root_power, root_power_shoup) in root_powers[2..]
+                    .iter_mut()
+                    .zip(root_powers_shoup[2..].iter_mut())
+                {
+                    wk = Div32::rem_u64(wk as u64 * w as u64, p_div);
+                    *root_power = wk;
+                    *root_power_shoup = Div32::div_u64((wk as u64) << 32, p_div) as u32
+                }
+
                 init_negacyclic_twiddles_shoup(
                     modulus,
                     polynomial_size,
@@ -661,6 +697,16 @@ impl Plan {
                     &mut inv_twid_shoup,
                 );
             } else {
+                let mut wk = w;
+
+                root_powers[0] = 1;
+                root_powers[1] = w;
+
+                for root_power in root_powers[2..].iter_mut() {
+                    wk = Div32::rem_u64(wk as u64 * w as u64, p_div);
+                    *root_power = wk;
+                }
+
                 init_negacyclic_twiddles(modulus, polynomial_size, &mut twid, &mut inv_twid);
             }
 
@@ -670,7 +716,14 @@ impl Plan {
             let big_l = big_q + 31;
             let p_barrett = ((1u64 << big_l) / modulus as u64) as u32;
 
+            let nbits = polynomial_size.trailing_zeros();
+            let reverse_lsbs: Vec<usize> =
+                (0..polynomial_size).map(|i| bit_rev(nbits, i)).collect();
+
             Some(Self {
+                root: w,
+                root_powers,
+                root_powers_shoup,
                 twid,
                 twid_shoup,
                 inv_twid_shoup,
@@ -681,8 +734,27 @@ impl Plan {
                 n_inv_mod_p_shoup,
                 p_barrett,
                 big_q,
+                reverse_lsbs,
             })
         }
+    }
+
+    /// Returns the root of the negacyclic NTT plan.
+    #[inline]
+    pub fn root(&self) -> u32 {
+        self.root
+    }
+
+    /// Returns a reference to the root powers of this [`Plan`].
+    #[inline]
+    pub fn root_powers(&self) -> &[u32] {
+        &self.root_powers
+    }
+
+    /// Returns a reference to the root powers shoup of this [`Plan`].
+    #[inline]
+    pub fn root_powers_shoup(&self) -> &[u32] {
+        &self.root_powers_shoup
     }
 
     pub(crate) fn p_div(&self) -> Div32 {
@@ -699,6 +771,114 @@ impl Plan {
     #[inline]
     pub fn modulus(&self) -> u32 {
         self.p
+    }
+
+    pub fn fwd_monomial(&self, coeff: u32, degree: usize, values: &mut [u32]) {
+        if coeff == 0 {
+            values.fill(0);
+            return;
+        }
+
+        if degree == 0 {
+            values.fill(coeff);
+            return;
+        }
+
+        let n = self.ntt_size();
+        let log_n = n.trailing_zeros();
+        assert_eq!(values.len(), n);
+
+        let mask = usize::MAX >> (usize::BITS - log_n - 1);
+
+        let p = self.p;
+
+        if coeff == 1 {
+            values
+                .iter_mut()
+                .zip(&self.reverse_lsbs)
+                .for_each(|(v, &i)| {
+                    let index = ((2 * i + 1) * degree) & mask;
+                    *v = unsafe { *self.root_powers.get_unchecked(index) };
+                })
+        } else if coeff == p - 1 {
+            values
+                .iter_mut()
+                .zip(&self.reverse_lsbs)
+                .for_each(|(v, &i)| {
+                    let index = (((2 * i + 1) * degree) & mask) ^ n;
+                    *v = unsafe { *self.root_powers.get_unchecked(index) };
+                })
+        } else {
+            if p < (1u32 << 31) {
+                values
+                    .iter_mut()
+                    .zip(&self.reverse_lsbs)
+                    .for_each(|(v, &i)| {
+                        let index = ((2 * i + 1) * degree) & mask;
+                        let e = unsafe { *self.root_powers.get_unchecked(index) };
+                        let e_shoup = unsafe { *self.root_powers_shoup.get_unchecked(index) };
+
+                        let hw = (((e_shoup as u64) * (coeff as u64)) >> 32) as u32;
+                        let t = e.wrapping_mul(coeff).wrapping_sub(hw.wrapping_mul(p));
+                        *v = t.min(t.wrapping_sub(p));
+                    })
+            } else {
+                values
+                    .iter_mut()
+                    .zip(&self.reverse_lsbs)
+                    .for_each(|(v, &i)| {
+                        let index = ((2 * i + 1) * degree) & mask;
+                        *v = generic::mul(
+                            self.p_div,
+                            unsafe { *self.root_powers.get_unchecked(index) },
+                            coeff,
+                        );
+                    })
+            }
+        }
+    }
+
+    pub fn fwd_coeff_one_monomial(&self, degree: usize, values: &mut [u32]) {
+        if degree == 0 {
+            values.fill(1);
+            return;
+        }
+
+        let n = self.ntt_size();
+        let log_n = n.trailing_zeros();
+        assert_eq!(values.len(), n);
+
+        let mask = usize::MAX >> (usize::BITS - log_n - 1);
+
+        values
+            .iter_mut()
+            .zip(&self.reverse_lsbs)
+            .for_each(|(v, &i)| {
+                let index = ((2 * i + 1) * degree) & mask;
+                *v = unsafe { *self.root_powers.get_unchecked(index) };
+            })
+    }
+
+    pub fn fwd_coeff_minus_one_monomial(&self, degree: usize, values: &mut [u32]) {
+        if degree == 0 {
+            let neg_one = self.p - 1;
+            values.fill(neg_one);
+            return;
+        }
+
+        let n = self.ntt_size();
+        let log_n = n.trailing_zeros();
+        assert_eq!(values.len(), n);
+
+        let mask = usize::MAX >> (usize::BITS - log_n - 1);
+
+        values
+            .iter_mut()
+            .zip(&self.reverse_lsbs)
+            .for_each(|(v, &i)| {
+                let index = (((2 * i + 1) * degree) & mask) ^ n;
+                *v = unsafe { *self.root_powers.get_unchecked(index) };
+            })
     }
 
     /// Applies a forward negacyclic NTT transform in place to the given buffer.
